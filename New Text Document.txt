@@ -1,0 +1,560 @@
+Code
+┌──────────────────────────────┐
+                          │   Presentation Layer (UI)    │
+                          │ Emerald / Gold / Dark Theme  │
+                          │  LTR (EN)  ◄───►  RTL (AR)    │
+                          └──────────────┬───────────────┘
+                                         │
+                          ┌──────────────▼───────────────┐
+                          │  State Management (Riverpod) │
+                          └──────────────┬───────────────┘
+                                         │
+        ┌───────────────────┬────────────┴───────┬───────────────────┐
+        ▼                   ▼                    ▼                   ▼
+┌───────────────┐   ┌───────────────┐    ┌───────────────┐   ┌───────────────┐
+│ Prayer Engine │   │ Qibla Compass │    │  Quran Audio  │   │  Local Data   │
+│ adhan / GPS   │   │ Magnetometer  │    │  just_audio   │   │  Isar/Hive    │
+└───────┬───────┘   └───────────────┘    └───────┬───────┘   └───────────────┘
+        │                                        │
+┌───────▼───────┐                        ┌───────▼───────┐
+│ Notifications │                        │ Quran.com API │
+│ Adhan trigger │                        │ v4 CDN stream │
+└───────────────┘                        └───────────────┘
+Core Dependencies (pubspec.yaml)
+Yaml
+dependencies:
+  flutter:
+    sdk: flutter
+  flutter_localizations:
+    sdk: flutter
+  flutter_riverpod: ^2.5.1
+  # Prayer Times & Sensors
+  adhan: ^2.0.0-nullsafety.1
+  geolocator: ^11.0.0
+  flutter_compass: ^0.8.0
+  # Audio & Background Playback
+  just_audio: ^0.9.36
+  audio_service: ^0.18.12
+  # Notifications
+  flutter_local_notifications: ^17.1.0
+  timezone: ^0.9.2
+  # Storage & Network
+  dio: ^5.4.1
+  hive_flutter: ^1.1.0
+  vibration: ^1.8.4
+2. Design System & Theme Tokens
+The application follows an Islamic aesthetic: deep spiritual emerald green as the anchor, warm desert gold for highlights, and high-contrast night/reading modes.
+Dart
+// lib/core/theme/app_theme.dart
+import 'package:flutter/material.dart';
+
+class IslamicTheme {
+  // Brand Colors
+  static const Color primaryEmerald = Color(0xFF0D5C3A);
+  static const Color secondaryEmerald = Color(0xFF073B24);
+  static const Color accentGold = Color(0xFFD4AF37);
+  static const Color lightGold = Color(0xFFF3E5AB);
+  static const Color bgDark = Color(0xFF0B1612);
+  static const Color surfaceDark = Color(0xFF13231E);
+
+  static ThemeData lightTheme = ThemeData(
+    useMaterial3: true,
+    brightness: Brightness.light,
+    primaryColor: primaryEmerald,
+    scaffoldBackgroundColor: const Color(0xFFF9FBF9),
+    colorScheme: const ColorScheme.light(
+      primary: primaryEmerald,
+      secondary: accentGold,
+      surface: Colors.white,
+    ),
+    fontFamily: 'UthmanicHafs', // Set for authentic typography
+  );
+
+  static ThemeData darkTheme = ThemeData(
+    useMaterial3: true,
+    brightness: Brightness.dark,
+    primaryColor: accentGold,
+    scaffoldBackgroundColor: bgDark,
+    colorScheme: const ColorScheme.dark(
+      primary: accentGold,
+      secondary: primaryEmerald,
+      surface: surfaceDark,
+    ),
+    fontFamily: 'UthmanicHafs',
+  );
+}
+3. Feature Implementations
+Feature 1: Prayer Times Engine & Adhan Notifications
+Calculates times using astronomical algorithms based on coordinates and juristic settings, and schedules foreground/background Adhan alerts.
+Dart
+// lib/features/prayer_times/prayer_service.dart
+import 'package:adhan/adhan.dart';
+import 'package:geolocator/geolocator.dart';
+import 'package:flutter_local_notifications/flutter_local_notifications.dart';
+import 'package:timezone/timezone.dart' as tz;
+
+class PrayerService {
+  final FlutterLocalNotificationsPlugin _notificationsPlugin = FlutterLocalNotificationsPlugin();
+
+  Future<PrayerTimes> calculatePrayerTimes(Position position) async {
+    final coordinates = Coordinates(position.latitude, position.longitude);
+    
+    // Choose appropriate calculation method (e.g., Muslim World League, Umm al-Qura)
+    final params = CalculationMethod.muslim_world_league.getParameters();
+    params.madhab = Madhab.shafi; // or Madhab.hanafi for Asr timing
+
+    final date = DateComponents.from(DateTime.now());
+    return PrayerTimes(coordinates, date, params);
+  }
+
+  Future<void> schedulePrayerNotifications(PrayerTimes times) async {
+    final prayers = {
+      'Fajr': times.fajr,
+      'Dhuhr': times.dhuhr,
+      'Asr': times.asr,
+      'Maghrib': times.maghrib,
+      'Isha': times.isha,
+    };
+
+    int id = 0;
+    for (var entry in prayers.entries) {
+      if (entry.value.isAfter(DateTime.now())) {
+        await _notificationsPlugin.zonedSchedule(
+          id++,
+          'Time for ${entry.key}',
+          'حي على الصلاة - حي على الفلاح',
+          tz.TZDateTime.from(entry.value, tz.local),
+          const NotificationDetails(
+            android: AndroidNotificationDetails(
+              'adhan_channel',
+              'Adhan Notifications',
+              importance: Importance.max,
+              priority: Priority.high,
+              sound: RawResourceAndroidNotificationSound('adhan'), // Bundled audio
+              playSound: true,
+            ),
+            iOS: DarwinNotificationDetails(sound: 'adhan.aiff'),
+          ),
+          androidScheduleMode: AndroidScheduleMode.exactAllowWhileIdle,
+          uiLocalNotificationDateInterpretation:
+              UILocalNotificationDateInterpretation.absoluteTime,
+        );
+      }
+    }
+  }
+}
+Feature 2: Qibla Direction (Bearing Calculation & Compass)
+Uses spherical trigonometry to find the Great Circle bearing toward the Kaaba (
+21.422487
+∘
+N
+,
+39.826206
+∘
+E
+21.422487 
+∘
+ N,39.826206 
+∘
+ E
+) and computes deviation using the hardware magnetometer.
+Dart
+// lib/features/qibla/qibla_math.dart
+import 'dart:math' as math;
+import 'package:geolocator/geolocator.dart';
+
+class QiblaCalculator {
+  static const double meccaLat = 21.422487;
+  static const double meccaLng = 39.826206;
+
+  static double calculateQiblaAngle(Position pos) {
+    double latRad = pos.latitude * (math.pi / 180.0);
+    double lngRad = pos.longitude * (math.pi / 180.0);
+    double meccaLatRad = meccaLat * (math.pi / 180.0);
+    double meccaLngRad = meccaLng * (math.pi / 180.0);
+
+    double deltaLng = meccaLngRad - lngRad;
+
+    double y = math.sin(deltaLng);
+    double x = math.cos(latRad) * math.tan(meccaLatRad) -
+        math.sin(latRad) * math.cos(deltaLng);
+
+    double qibla = math.atan2(y, x) * (180.0 / math.pi);
+    return (qibla + 360.0) % 360.0;
+  }
+}
+Dart
+// lib/features/qibla/qibla_view.dart
+import 'dart:math' as math;
+import 'package:flutter/material.dart';
+import 'package:flutter_compass/flutter_compass.dart';
+import 'package:geolocator/geolocator.dart';
+import 'qibla_math.dart';
+
+class QiblaCompassView extends StatefulWidget {
+  final Position currentPosition;
+  const QiblaCompassView({super.key, required this.currentPosition});
+
+  @override
+  State<QiblaCompassView> createState() => _QiblaCompassViewState();
+}
+
+class _QiblaCompassViewState extends State<QiblaCompassView> {
+  late double _qiblaBearing;
+
+  @override
+  void initState() {
+    super.initState();
+    _qiblaBearing = QiblaCalculator.calculateQiblaAngle(widget.currentPosition);
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    return StreamBuilder<CompassEvent>(
+      stream: FlutterCompass.events,
+      builder: (context, snapshot) {
+        if (!snapshot.hasData || snapshot.data?.heading == null) {
+          return const Center(child: CircularProgressIndicator());
+        }
+
+        double heading = snapshot.data!.heading!;
+        // Needle points to Qibla relative to device heading
+        double diff = (_qiblaBearing - heading) * (math.pi / 180.0);
+
+        return Center(
+          child: Stack(
+            alignment: Alignment.center,
+            children: [
+              // Compass Dial
+              Transform.rotate(
+                angle: -heading * (math.pi / 180.0),
+                child: Image.asset('assets/images/compass_dial.png', width: 300),
+              ),
+              // Needle pointing to Makkah
+              Transform.rotate(
+                angle: diff,
+                child: Image.asset('assets/images/qibla_needle.png', width: 260),
+              ),
+              Positioned(
+                bottom: 40,
+                child: Text(
+                  "${_qiblaBearing.toStringAsFixed(1)}° from North",
+                  style: const TextStyle(fontWeight: FontWeight.bold, fontSize: 18),
+                ),
+              )
+            ],
+          ),
+        );
+      },
+    );
+  }
+}
+Feature 3: Daily Adhkar & Digital Tasbeeh Counter
+Contains morning/evening supplications with vibration haptics on target completion.
+Dart
+// lib/features/adhkar/tasbeeh_model.dart
+class DhikrItem {
+  final int id;
+  final String arabicText;
+  final String translation;
+  final int targetCount;
+  int currentCount;
+
+  DhikrItem({
+    required this.id,
+    required this.arabicText,
+    required this.translation,
+    required this.targetCount,
+    this.currentCount = 0,
+  });
+}
+Dart
+// lib/features/adhkar/tasbeeh_screen.dart
+import 'package:flutter/material.dart';
+import 'package:vibration/vibration.dart';
+
+class TasbeehCounterScreen extends StatefulWidget {
+  final DhikrItem dhikr;
+  const TasbeehCounterScreen({super.key, required this.dhikr});
+
+  @override
+  State<TasbeehCounterScreen> createState() => _TasbeehCounterScreenState();
+}
+
+class _TasbeehCounterScreenState extends State<TasbeehCounterScreen> {
+  void _increment() async {
+    if (widget.dhikr.currentCount < widget.dhikr.targetCount) {
+      setState(() => widget.dhikr.currentCount++);
+      
+      if (widget.dhikr.currentCount == widget.dhikr.targetCount) {
+        // Heavy vibration on reaching goal
+        if (await Vibration.hasVibrator() ?? false) {
+          Vibration.vibrate(pattern: [0, 200, 100, 200]);
+        }
+      } else {
+        // Light tap feedback
+        Vibration.vibrate(duration: 30);
+      }
+    }
+  }
+
+  void _reset() => setState(() => widget.dhikr.currentCount = 0);
+
+  @override
+  Widget build(BuildContext context) {
+    double progress = widget.dhikr.currentCount / widget.dhikr.targetCount;
+
+    return Scaffold(
+      appBar: AppBar(title: const Text('المسبحة الإلكترونية')),
+      body: Padding(
+        padding: const EdgeInsets.all(24.0),
+        child: Column(
+          children: [
+            Text(
+              widget.dhikr.arabicText,
+              textAlign: TextAlign.center,
+              style: const TextStyle(fontSize: 22, height: 1.6),
+            ),
+            const Spacer(),
+            GestureDetector(
+              onTap: _increment,
+              child: Stack(
+                alignment: Alignment.center,
+                children: [
+                  SizedBox(
+                    width: 220,
+                    height: 220,
+                    child: CircularProgressIndicator(
+                      value: progress,
+                      strokeWidth: 12,
+                      color: const Color(0xFFD4AF37),
+                      backgroundColor: Colors.grey.shade300,
+                    ),
+                  ),
+                  CircleAvatar(
+                    radius: 90,
+                    backgroundColor: const Color(0xFF0D5C3A),
+                    child: Column(
+                      mainAxisAlignment: MainAxisAlignment.center,
+                      children: [
+                        Text(
+                          '${widget.dhikr.currentCount}',
+                          style: const TextStyle(color: Colors.white, fontSize: 48, fontWeight: FontWeight.bold),
+                        ),
+                        Text(
+                          '/ ${widget.dhikr.targetCount}',
+                          style: const TextStyle(color: Colors.white70, fontSize: 16),
+                        ),
+                      ],
+                    ),
+                  ),
+                ],
+              ),
+            ),
+            const Spacer(),
+            IconButton(
+              icon: const Icon(Icons.refresh, size: 32),
+              onPressed: _reset,
+            ),
+            const SizedBox(height: 20),
+          ],
+        ),
+      ),
+    );
+  }
+}
+Feature 4: The Holy Quran (Dual-Mode: Uthmani Text & Audio Streamer)
+Dart
+// lib/features/quran/models/quran_models.dart
+class Ayah {
+  final int number;
+  final int surahNumber;
+  final String textUthmani;
+  final String audioUrl;
+
+  Ayah({
+    required this.number,
+    required this.surahNumber,
+    required this.textUthmani,
+    required this.audioUrl,
+  });
+}
+Integrates with the just_audio playback engine to stream verses continuously or Surah-by-Surah across different reciters (e.g., Mishary Rashid Alafasy, Abdul Basit).
+Dart
+// lib/features/quran/audio/quran_audio_player.dart
+import 'package:just_audio/just_audio.dart';
+import 'package:audio_service/audio_service.dart';
+
+class QuranAudioController {
+  final AudioPlayer _player = AudioPlayer();
+
+  // Quran.com CDN format or EveryAyah endpoints
+  String buildAyahAudioUrl(String reciterCode, int surah, int ayah) {
+    // Example format: 001001.mp3 for Surah 1 Ayah 1
+    String s = surah.toString().padLeft(3, '0');
+    String a = ayah.toString().padLeft(3, '0');
+    return "https://everyayah.com/data/$reciterCode/$s$a.mp3";
+  }
+
+  Future<void> playAyahRange(List<String> audioUrls) async {
+    final playlist = ConcatenatingAudioSource(
+      children: audioUrls.map((url) => AudioSource.uri(Uri.parse(url))).toList(),
+    );
+
+    await _player.setAudioSource(playlist);
+    _player.play();
+  }
+
+  void pause() => _player.pause();
+  void resume() => _player.play();
+  void dispose() => _player.dispose();
+}
+Dart
+// lib/features/quran/ui/quran_reader_screen.dart
+import 'package:flutter/material.dart';
+import '../models/quran_models.dart';
+
+class QuranReaderScreen extends StatelessWidget {
+  final String surahName;
+  final List<Ayah> ayahs;
+
+  const QuranReaderScreen({
+    super.key,
+    required this.surahName,
+    required this.ayahs,
+  });
+
+  @override
+  Widget build(BuildContext context) {
+    return Scaffold(
+      appBar: AppBar(
+        title: Text(surahName),
+        actions: [
+          IconButton(
+            icon: const Icon(Icons.bookmark_border),
+            onPressed: () {
+              // Save bookmark to Hive/Isar
+            },
+          )
+        ],
+      ),
+      body: Directionality(
+        textDirection: TextDirection.rtl, // Forces Arabic layout
+        child: ListView.separated(
+          padding: const EdgeInsets.symmetric(horizontal: 16.0, vertical: 24.0),
+          itemCount: ayahs.length,
+          separatorBuilder: (context, index) => const Divider(height: 32),
+          itemBuilder: (context, index) {
+            final ayah = ayahs[index];
+            return Padding(
+              padding: const EdgeInsets.symmetric(vertical: 4.0),
+              child: RichText(
+                textAlign: TextAlign.justify,
+                text: TextSpan(
+                  children: [
+                    TextSpan(
+                      text: ayah.textUthmani,
+                      style: const TextStyle(
+                        fontFamily: 'UthmanicHafs',
+                        fontSize: 24,
+                        color: Colors.black,
+                        height: 2.0,
+                      ),
+                    ),
+                    WidgetSpan(
+                      alignment: PlaceholderAlignment.middle,
+                      child: Container(
+                        margin: const EdgeInsets.symmetric(horizontal: 6),
+                        padding: const EdgeInsets.all(6),
+                        decoration: BoxDecoration(
+                          shape: BoxShape.circle,
+                          border: Border.all(color: const Color(0xFFD4AF37), width: 1.5),
+                        ),
+                        child: Text(
+                          '${ayah.number}',
+                          style: const TextStyle(fontSize: 12, fontWeight: FontWeight.bold),
+                        ),
+                      ),
+                    ),
+                  ],
+                ),
+              ),
+            );
+          },
+        ),
+      ),
+    );
+  }
+}
+4. Localization Configuration (RTL / LTR)
+In your MaterialApp configuration, setup localization delegates to seamlessly swap between Arabic (ar) and English (en):
+Dart
+// lib/main.dart
+import 'package:flutter/material.dart';
+import 'package:flutter_localizations/flutter_localizations.dart';
+import 'core/theme/app_theme.dart';
+
+void main() => runApp(const IslamicApp());
+
+class IslamicApp extends StatelessWidget {
+  const IslamicApp({super.key});
+
+  @override
+  Widget build(BuildContext context) {
+    return MaterialApp(
+      title: 'Islamic Companion',
+      theme: IslamicTheme.lightTheme,
+      darkTheme: IslamicTheme.darkTheme,
+      themeMode: ThemeMode.system,
+      
+      // Localization
+      locale: const Locale('ar'), // Set default or pull from device
+      supportedLocales: const [
+        Locale('en', ''),
+        Locale('ar', ''),
+      ],
+      localizationsDelegates: const [
+        GlobalMaterialLocalizations.delegate,
+        GlobalWidgetsLocalizations.delegate,
+        GlobalCupertinoLocalizations.delegate,
+      ],
+      home: const MainNavigationShell(),
+    );
+  }
+}
+
+class MainNavigationShell extends StatelessWidget {
+  const MainNavigationShell({super.key});
+
+  @override
+  Widget build(BuildContext context) {
+    return Scaffold(
+      bottomNavigationBar: NavigationBar(
+        destinations: const [
+          NavigationDestination(icon: Icon(Icons.access_time), label: 'الصلاة'),
+          NavigationDestination(icon: Icon(Icons.explore), label: 'القبلة'),
+          NavigationDestination(icon: Icon(Icons.menu_book), label: 'القرآن'),
+          NavigationDestination(icon: Icon(Icons.fingerprint), label: 'الأذكار'),
+        ],
+      ),
+    );
+  }
+}
+5. Production Setup Checklist
+Android Permissions (AndroidManifest.xml):
+Xml
+<uses-permission android:name="android.permission.ACCESS_FINE_LOCATION" />
+<uses-permission android:name="android.permission.ACCESS_COARSE_LOCATION" />
+<uses-permission android:name="android.permission.INTERNET"/>
+<uses-permission android:name="android.permission.VIBRATE"/>
+<uses-permission android:name="android.permission.RECEIVE_BOOT_COMPLETED"/>
+<uses-permission android:name="android.permission.SCHEDULE_EXACT_ALARM"/>
+iOS Configuration (Info.plist):
+Xml
+<key>NSLocationWhenInUseUsageDescription</key>
+<string>Required to calculate accurate prayer times and Qibla direction.</string>
+<key>UIBackgroundModes</key>
+<array>
+    <string>audio</string>
+    <string>fetch</string>
+</array>
